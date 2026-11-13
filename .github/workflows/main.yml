@@ -15,21 +15,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
+    env:
+      STUDIO_TOKEN: ${{ secrets.STUDIO_TOKEN }}
+      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+
     steps:
-      - name: Install system dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           set -e
+
           sudo apt-get update
+
           sudo apt-get install -y \
-            python3 ffmpeg curl wget unzip zip \
-            xvfb x11vnc fluxbox \
-            websockify novnc \
-            dbus-x11 ca-certificates
+            python3 \
+            ffmpeg \
+            curl \
+            wget \
+            unzip \
+            zip \
+            xvfb \
+            x11vnc \
+            fluxbox \
+            websockify \
+            novnc \
+            dbus-x11 \
+            ca-certificates
 
           sudo snap install firefox
 
-      - name: Create Cloud Media Studio
+      - name: Generate application
         shell: bash
         run: |
           set -e
@@ -37,11 +52,10 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/cloud-media-studio"
           cd "$GITHUB_WORKSPACE/cloud-media-studio"
 
-          mkdir -p Downloads outputs profile scripts
+          mkdir -p Downloads outputs profile/extensions
 
           cat > server.py <<'PY'
           import os
-          import re
           import json
           import time
           import uuid
@@ -50,6 +64,7 @@ jobs:
           import secrets
           import threading
           import subprocess
+
           from pathlib import Path
           from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
           from urllib.parse import unquote
@@ -59,55 +74,63 @@ jobs:
           OUTPUTS = ROOT / "outputs"
           WEB = ROOT / "index.html"
 
-          ACCESS_TOKEN = os.environ["STUDIO_TOKEN"]
-          LINK_TTL = 30 * 60
+          TOKEN = os.environ["STUDIO_TOKEN"]
+          LINK_TTL = 1800
 
           links = {}
           lock = threading.Lock()
 
-          for folder in (DOWNLOADS, OUTPUTS):
-              folder.mkdir(exist_ok=True)
+          DOWNLOADS.mkdir(exist_ok=True)
+          OUTPUTS.mkdir(exist_ok=True)
 
-          def safe_file(name):
-              name = Path(unquote(name)).name
+          def safe_name(name):
+              name = Path(unquote(str(name))).name
               if not name or name in (".", ".."):
                   raise ValueError("Invalid filename")
               return name
 
           def find_file(name):
-              name = safe_file(name)
-              for folder in (DOWNLOADS, OUTPUTS):
-                  candidate = folder / name
-                  if candidate.is_file():
-                      return candidate
-              raise FileNotFoundError(name)
+              name = safe_name(name)
 
-          def cleanup():
-              while True:
-                  now = time.time()
-                  with lock:
-                      expired = [
-                          token for token, item in links.items()
-                          if item["expires"] <= now
-                      ]
-                      for token in expired:
-                          item = links.pop(token)
-                          try:
-                              item["path"].unlink(missing_ok=True)
-                          except OSError:
-                              pass
-                  time.sleep(15)
+              for folder in (DOWNLOADS, OUTPUTS):
+                  path = folder / name
+                  if path.is_file():
+                      return path
+
+              raise FileNotFoundError(name)
 
           def issue_link(path):
               token = secrets.token_urlsafe(32)
+
               with lock:
                   links[token] = {
                       "path": path,
                       "expires": time.time() + LINK_TTL
                   }
+
               return "/d/" + token
 
-          def run_ffmpeg(args):
+          def cleanup():
+              while True:
+                  now = time.time()
+
+                  with lock:
+                      expired = [
+                          key for key, value in links.items()
+                          if value["expires"] <= now
+                      ]
+
+                      for key in expired:
+                          item = links.pop(key)
+
+                          try:
+                              item["path"].unlink(missing_ok=True)
+                          except OSError:
+                              pass
+
+                  time.sleep(15)
+
+          def ffmpeg(args):
               result = subprocess.run(
                   ["ffmpeg", "-hide_banner", "-y"] + args,
                   stdout=subprocess.PIPE,
@@ -115,18 +138,28 @@ jobs:
                   text=True,
                   timeout=1800
               )
-              if result.returncode != 0:
-                  raise RuntimeError(result.stderr[-1800:])
-              return result
+
+              if result.returncode:
+                  raise RuntimeError(result.stderr[-2000:])
 
           class Handler(BaseHTTPRequestHandler):
+
               server_version = "CloudMediaStudio/1.0"
 
               def log_message(self, fmt, *args):
                   print("[HTTP]", fmt % args)
 
+              def authorized(self):
+                  supplied = self.headers.get("Authorization", "")
+
+                  return secrets.compare_digest(
+                      supplied,
+                      "Bearer " + TOKEN
+                  )
+
               def send_json(self, data, status=200):
                   raw = json.dumps(data).encode()
+
                   self.send_response(status)
                   self.send_header("Content-Type", "application/json")
                   self.send_header("Content-Length", str(len(raw)))
@@ -134,17 +167,12 @@ jobs:
                   self.end_headers()
                   self.wfile.write(raw)
 
-              def authorized(self):
-                  header = self.headers.get("Authorization", "")
-                  return secrets.compare_digest(
-                      header,
-                      "Bearer " + ACCESS_TOKEN
-                  )
-
               def body_json(self):
                   length = int(self.headers.get("Content-Length", "0"))
+
                   if length > 1024 * 1024:
                       raise ValueError("Request too large")
+
                   return json.loads(self.rfile.read(length) or b"{}")
 
               def do_GET(self):
@@ -152,8 +180,12 @@ jobs:
 
                   if path == "/":
                       raw = WEB.read_bytes()
+
                       self.send_response(200)
-                      self.send_header("Content-Type", "text/html; charset=utf-8")
+                      self.send_header(
+                          "Content-Type",
+                          "text/html; charset=utf-8"
+                      )
                       self.send_header("Content-Length", str(len(raw)))
                       self.end_headers()
                       self.wfile.write(raw)
@@ -161,33 +193,39 @@ jobs:
 
                   if path.startswith("/d/"):
                       token = path[3:]
+
                       with lock:
                           item = links.get(token)
 
                       if not item or item["expires"] <= time.time():
-                          self.send_error(404, "Link expired or invalid")
+                          self.send_error(404, "Link expired")
                           return
 
-                      file_path = item["path"]
-                      if not file_path.is_file():
+                      file = item["path"]
+
+                      if not file.is_file():
                           self.send_error(404)
                           return
 
                       self.send_response(200)
                       self.send_header(
-                          "Content-Type", "application/octet-stream"
+                          "Content-Type",
+                          "application/octet-stream"
                       )
                       self.send_header(
                           "Content-Disposition",
-                          'attachment; filename="' + file_path.name.replace('"', '') + '"'
+                          'attachment; filename="' +
+                          file.name.replace('"', '') + '"'
                       )
                       self.send_header(
-                          "Content-Length", str(file_path.stat().st_size)
+                          "Content-Length",
+                          str(file.stat().st_size)
                       )
                       self.end_headers()
 
-                      with file_path.open("rb") as f:
-                          shutil.copyfileobj(f, self.wfile)
+                      with file.open("rb") as stream:
+                          shutil.copyfileobj(stream, self.wfile)
+
                       return
 
                   if not self.authorized():
@@ -197,25 +235,29 @@ jobs:
                   if path == "/api/status":
                       self.send_json({
                           "ok": True,
-                          "downloads": len([
-                              p for p in DOWNLOADS.iterdir() if p.is_file()
-                          ]),
-                          "outputs": len([
-                              p for p in OUTPUTS.iterdir() if p.is_file()
-                          ])
+                          "downloads": sum(
+                              p.is_file() for p in DOWNLOADS.iterdir()
+                          ),
+                          "outputs": sum(
+                              p.is_file() for p in OUTPUTS.iterdir()
+                          )
                       })
                       return
 
                   if path == "/api/files":
                       files = []
+
                       for folder in (DOWNLOADS, OUTPUTS):
-                          for p in folder.iterdir():
-                              if p.is_file() and not p.name.endswith(".part"):
+                          for file in folder.iterdir():
+                              if file.is_file() and not file.name.endswith(
+                                  (".part", ".uploading")
+                              ):
                                   files.append({
-                                      "name": p.name,
-                                      "size": p.stat().st_size,
+                                      "name": file.name,
+                                      "size": file.stat().st_size,
                                       "location": folder.name
                                   })
+
                       self.send_json({"files": files})
                       return
 
@@ -228,43 +270,57 @@ jobs:
 
                   try:
                       if self.path == "/api/upload":
-                          name = safe_file(
+                          name = safe_name(
                               self.headers.get("X-Filename", "upload.bin")
                           )
-                          length = int(self.headers.get("Content-Length", "0"))
 
-                          if length <= 0 or length > 2 * 1024 * 1024 * 1024:
+                          length = int(
+                              self.headers.get("Content-Length", "0")
+                          )
+
+                          if length <= 0 or length > 2 * 1024**3:
                               raise ValueError("Invalid upload size")
 
                           destination = DOWNLOADS / name
-                          temp = DOWNLOADS / (name + ".uploading")
+                          temp = DOWNLOADS / (
+                              name + "." + uuid.uuid4().hex + ".uploading"
+                          )
 
                           remaining = length
-                          with temp.open("wb") as f:
+
+                          with temp.open("wb") as stream:
                               while remaining:
-                                  chunk = self.rfile.read(min(1024 * 1024, remaining))
+                                  chunk = self.rfile.read(
+                                      min(1024 * 1024, remaining)
+                                  )
+
                                   if not chunk:
                                       raise ValueError("Incomplete upload")
-                                  f.write(chunk)
+
+                                  stream.write(chunk)
                                   remaining -= len(chunk)
 
                           temp.replace(destination)
-                          self.send_json({"ok": True, "name": name})
+
+                          self.send_json({
+                              "ok": True,
+                              "name": name
+                          })
                           return
 
                       data = self.body_json()
 
                       if self.path == "/api/process":
-                          name = safe_file(data.get("name", ""))
+                          name = safe_name(data.get("name", ""))
                           operation = data.get("operation")
                           source = find_file(name)
 
-                          output_name = str(uuid.uuid4())
-                          output = OUTPUTS / output_name
+                          output = OUTPUTS / str(uuid.uuid4())
 
                           if operation == "compress":
                               output = output.with_suffix(".mp4")
-                              run_ffmpeg([
+
+                              ffmpeg([
                                   "-i", str(source),
                                   "-c:v", "libx264",
                                   "-preset", "veryfast",
@@ -276,7 +332,8 @@ jobs:
 
                           elif operation == "mp3":
                               output = output.with_suffix(".mp3")
-                              run_ffmpeg([
+
+                              ffmpeg([
                                   "-i", str(source),
                                   "-vn",
                                   "-codec:a", "libmp3lame",
@@ -286,7 +343,8 @@ jobs:
 
                           elif operation == "thumbnail":
                               output = output.with_suffix(".jpg")
-                              run_ffmpeg([
+
+                              ffmpeg([
                                   "-ss", "00:00:03",
                                   "-i", str(source),
                                   "-frames:v", "1",
@@ -297,7 +355,7 @@ jobs:
                               raise ValueError("Unknown operation")
 
                           if not output.is_file():
-                              raise RuntimeError("Output was not created")
+                              raise RuntimeError("Output not created")
 
                           self.send_json({
                               "ok": True,
@@ -308,20 +366,25 @@ jobs:
                           return
 
                       if self.path == "/api/zip":
-                          data = self.body_json()
                           names = data.get("names", [])
 
-                          if not isinstance(names, list) or not names or len(names) > 100:
-                              raise ValueError("Select between 1 and 100 files")
+                          if (
+                              not isinstance(names, list)
+                              or not names
+                              or len(names) > 100
+                          ):
+                              raise ValueError("Invalid file list")
 
-                          output = OUTPUTS / (str(uuid.uuid4()) + ".zip")
+                          output = OUTPUTS / (
+                              str(uuid.uuid4()) + ".zip"
+                          )
 
                           with zipfile.ZipFile(
                               output, "w", zipfile.ZIP_DEFLATED
                           ) as archive:
                               for name in names:
-                                  source = find_file(name)
-                                  archive.write(source, arcname=source.name)
+                                  file = find_file(name)
+                                  archive.write(file, arcname=file.name)
 
                           self.send_json({
                               "ok": True,
@@ -332,10 +395,10 @@ jobs:
                           return
 
                       if self.path == "/api/link":
-                          data = self.body_json()
-                          source = find_file(data.get("name", ""))
+                          file = find_file(data.get("name", ""))
+
                           self.send_json({
-                              "download": issue_link(source),
+                              "download": issue_link(file),
                               "expires_in_seconds": LINK_TTL
                           })
                           return
@@ -347,8 +410,12 @@ jobs:
 
           threading.Thread(target=cleanup, daemon=True).start()
 
-          print("Dashboard server listening on 8080")
-          ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+          print("Dashboard listening on port 8080")
+
+          ThreadingHTTPServer(
+              ("0.0.0.0", 8080),
+              Handler
+          ).serve_forever()
           PY
 
           cat > index.html <<'HTML'
@@ -357,82 +424,156 @@ jobs:
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
+
           <title>Cloud Media Studio</title>
+
           <style>
           *{box-sizing:border-box}
-          body{margin:0;background:#0b1020;color:#e8edff;font:15px Arial,sans-serif}
-          header{padding:22px 5%;background:#111a31;border-bottom:1px solid #253250}
-          header h1{margin:0;font-size:23px}
-          header p{color:#91a0c2;margin:7px 0 0}
+          body{
+            margin:0;
+            background:#0b1020;
+            color:#e8edff;
+            font:15px Arial,sans-serif
+          }
+          header{
+            padding:22px 5%;
+            background:#111a31;
+            border-bottom:1px solid #253250
+          }
+          header h1{margin:0;font-size:24px}
+          header p{color:#91a0c2}
           main{max-width:1100px;margin:28px auto;padding:0 18px}
-          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
-          .card{background:#131d35;border:1px solid #263654;border-radius:14px;padding:19px}
-          h2{font-size:17px;margin-top:0}
-          button,.button{background:#4269ee;color:white;border:0;border-radius:8px;padding:10px 14px;cursor:pointer;text-decoration:none;display:inline-block}
+          .grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+            gap:16px
+          }
+          .card{
+            background:#131d35;
+            border:1px solid #263654;
+            border-radius:14px;
+            padding:19px
+          }
+          h2{font-size:17px}
+          button,.button{
+            background:#4269ee;
+            color:white;
+            border:0;
+            border-radius:8px;
+            padding:10px 14px;
+            cursor:pointer;
+            text-decoration:none;
+            display:inline-block
+          }
           button:hover,.button:hover{background:#3154ce}
-          input{max-width:100%;background:#0b1428;color:white;border:1px solid #354767;padding:10px;border-radius:8px}
+          input{
+            max-width:100%;
+            background:#0b1428;
+            color:white;
+            border:1px solid #354767;
+            padding:10px;
+            border-radius:8px
+          }
           .muted{color:#9baacb;font-size:13px}
           #files{margin-top:15px}
-          .file{padding:12px;margin:8px 0;background:#0c162c;border-radius:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+          .file{
+            padding:12px;
+            margin:8px 0;
+            background:#0c162c;
+            border-radius:8px;
+            display:flex;
+            gap:12px;
+            align-items:center;
+            flex-wrap:wrap
+          }
           .file span{flex:1;overflow-wrap:anywhere}
-          #message{margin:18px 0;color:#9fbcff;overflow-wrap:anywhere}
-          a{color:#a9c0ff}
+          #message{
+            margin:18px 0;
+            color:#9fbcff;
+            overflow-wrap:anywhere
+          }
           </style>
           </head>
+
           <body>
           <header>
             <h1>Cloud Media Studio</h1>
             <p>Your temporary cloud media workstation</p>
           </header>
+
           <main>
             <div class="grid">
               <section class="card">
                 <h2>Remote Firefox</h2>
-                <p class="muted">Open the full Firefox desktop in a separate tab.</p>
-                <a class="button" id="browser" target="_blank" rel="noopener">Open Browser</a>
+                <p class="muted">Open the full remote browser.</p>
+                <a class="button" id="browser"
+                   target="_blank" rel="noopener">Open Browser</a>
               </section>
+
               <section class="card">
                 <h2>Upload files</h2>
                 <input type="file" id="upload">
                 <p><button onclick="uploadFile()">Upload</button></p>
               </section>
+
               <section class="card">
-                <h2>Refresh files</h2>
-                <p class="muted">View files uploaded here or downloaded inside Firefox.</p>
+                <h2>File manager</h2>
+                <p class="muted">Refresh your downloaded and uploaded files.</p>
                 <button onclick="loadFiles()">Refresh</button>
               </section>
             </div>
 
-            <p id="message">Enter your access token to connect.</p>
+            <p id="message">Connecting...</p>
 
             <section class="card">
               <h2>Files</h2>
               <div id="files"></div>
             </section>
           </main>
-          <script>
-          const token = localStorage.getItem("cms_token") ||
-            prompt("Enter the Studio access token:");
-          if(token) localStorage.setItem("cms_token", token);
 
-          const browserUrl = localStorage.getItem("cms_browser");
-          if(browserUrl) document.getElementById("browser").href = browserUrl;
-          else {
-            const value = prompt("Paste the Browser URL from GitHub Actions logs:");
-            if(value) {
-              localStorage.setItem("cms_browser", value);
-              document.getElementById("browser").href = value;
+          <script>
+          let token = localStorage.getItem("cms_token");
+
+          if (!token) {
+            token = prompt("Enter your Dashboard access token:");
+            if (token) localStorage.setItem("cms_token", token);
+          }
+
+          let browserUrl = localStorage.getItem("cms_browser");
+
+          if (!browserUrl) {
+            browserUrl = prompt("Enter the Browser URL from Actions:");
+            if (browserUrl) {
+              localStorage.setItem("cms_browser", browserUrl);
             }
           }
 
-          const headers = {"Authorization":"Bearer "+token};
-          const message = text => document.getElementById("message").textContent=text;
+          if (browserUrl) {
+            document.getElementById("browser").href =
+              browserUrl + "/vnc.html";
+          }
+
+          const headers = {
+            "Authorization": "Bearer " + token
+          };
+
+          const message = text => {
+            document.getElementById("message").textContent = text;
+          };
 
           async function api(path, options={}) {
-            options.headers = {...(options.headers||{}), ...headers};
+            options.headers = {
+              ...(options.headers || {}),
+              ...headers
+            };
+
             const response = await fetch(path, options);
             const data = await response.json();
-            if(!response.ok) throw new Error(data.error || "Request failed");
+
+            if (!response.ok) {
+              throw new Error(data.error || "Request failed");
+            }
+
             return data;
           }
 
@@ -440,75 +581,121 @@ jobs:
             try {
               const data = await api("/api/files");
               const box = document.getElementById("files");
+
               box.innerHTML = "";
+
               data.files.forEach(file => {
                 const row = document.createElement("div");
                 row.className = "file";
+
                 const label = document.createElement("span");
-                label.textContent = file.name + " — " +
-                  (file.size/1024/1024).toFixed(2) + " MB ("+file.location+")";
+
+                label.textContent =
+                  file.name + " — " +
+                  (file.size / 1024 / 1024).toFixed(2) +
+                  " MB (" + file.location + ")";
+
                 row.appendChild(label);
 
                 ["compress","mp3","thumbnail"].forEach(op => {
                   const button = document.createElement("button");
+
                   button.textContent = op;
                   button.onclick = () => processFile(file.name, op);
+
                   row.appendChild(button);
                 });
 
                 const linkButton = document.createElement("button");
+
                 linkButton.textContent = "Temporary link";
                 linkButton.onclick = () => makeLink(file.name);
+
                 row.appendChild(linkButton);
                 box.appendChild(row);
               });
+
               message(data.files.length + " files found.");
-            } catch(e) { message(e.message); }
+
+            } catch(e) {
+              message(e.message);
+            }
           }
 
           async function uploadFile() {
             const file = document.getElementById("upload").files[0];
-            if(!file) return message("Choose a file first.");
+
+            if (!file) {
+              message("Choose a file first.");
+              return;
+            }
+
             try {
               const response = await fetch("/api/upload", {
-                method:"POST",
-                headers:{
+                method: "POST",
+                headers: {
                   ...headers,
-                  "X-Filename":encodeURIComponent(file.name),
-                  "Content-Length":file.size
+                  "X-Filename": encodeURIComponent(file.name)
                 },
-                body:file
+                body: file
               });
+
               const data = await response.json();
-              if(!response.ok) throw new Error(data.error || "Upload failed");
-              message("Uploaded: "+data.name);
+
+              if (!response.ok) {
+                throw new Error(data.error || "Upload failed");
+              }
+
+              message("Uploaded: " + data.name);
               loadFiles();
-            } catch(e) { message(e.message); }
+
+            } catch(e) {
+              message(e.message);
+            }
           }
 
           async function processFile(name, operation) {
             try {
-              message("Processing "+name+"...");
+              message("Processing " + name + "...");
+
               const data = await api("/api/process", {
-                method:"POST",
-                headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({name,operation})
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({name, operation})
               });
-              message("Finished. Download: "+location.origin+data.download+
-                " — link expires in 30 minutes.");
-            } catch(e) { message(e.message); }
+
+              message(
+                "Finished: " +
+                location.origin + data.download +
+                " — expires in 30 minutes."
+              );
+
+            } catch(e) {
+              message(e.message);
+            }
           }
 
           async function makeLink(name) {
             try {
               const data = await api("/api/link", {
-                method:"POST",
-                headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({name})
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({name})
               });
-              message("Temporary download: "+location.origin+data.download+
-                " — expires in 30 minutes.");
-            } catch(e) { message(e.message); }
+
+              message(
+                "Temporary link: " +
+                location.origin + data.download +
+                " — expires in 30 minutes."
+              );
+
+            } catch(e) {
+              message(e.message);
+            }
           }
 
           loadFiles();
@@ -518,120 +705,185 @@ jobs:
           </html>
           HTML
 
-      - name: Configure Firefox profile
+      - name: Configure Firefox
         shell: bash
         run: |
           set -e
-          cd "$GITHUB_WORKSPACE/cloud-media-studio"
 
-          mkdir -p profile/extensions
+          cd "$GITHUB_WORKSPACE/cloud-media-studio"
 
           curl -fL \
             https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi \
             -o profile/extensions/uBlock0@raymondhill.net.xpi
 
-          cat > profile/user.js <<'EOF'
+          cat > profile/user.js <<EOF
           user_pref("browser.shell.checkDefaultBrowser", false);
           user_pref("browser.aboutwelcome.enabled", false);
           user_pref("browser.startup.homepage", "https://www.google.com");
           user_pref("browser.download.folderList", 2);
-          user_pref("browser.download.dir", "/home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}/cloud-media-studio/Downloads");
+          user_pref("browser.download.dir", "$GITHUB_WORKSPACE/cloud-media-studio/Downloads");
           user_pref("browser.download.useDownloadDir", true);
           user_pref("browser.download.manager.showWhenStarting", true);
           user_pref("extensions.autoDisableScopes", 0);
           user_pref("extensions.enabledScopes", 15);
-          user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
           EOF
 
-      - name: Start desktop and services
+      - name: Start Cloud Media Studio
         shell: bash
-        env:
-          STUDIO_TOKEN: ${{ secrets.STUDIO_TOKEN }}
         run: |
           set -e
+
           cd "$GITHUB_WORKSPACE/cloud-media-studio"
 
-          export DISPLAY=:99
+          if [ -z "$STUDIO_TOKEN" ]; then
+            echo "ERROR: STUDIO_TOKEN secret is missing."
+            exit 1
+          fi
 
-          STUDIO_TOKEN="${STUDIO_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"
-          VNC_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          if [ -z "$VNC_PASSWORD" ]; then
+            echo "ERROR: VNC_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          if [ "${#VNC_PASSWORD}" -gt 8 ]; then
+            echo "ERROR: VNC_PASSWORD must be 8 characters or fewer."
+            exit 1
+          fi
 
           echo "::add-mask::$STUDIO_TOKEN"
           echo "::add-mask::$VNC_PASSWORD"
 
-          echo "STUDIO_TOKEN=$STUDIO_TOKEN" >> "$GITHUB_ENV"
-          echo "VNC_PASSWORD=$VNC_PASSWORD" >> "$GITHUB_ENV"
+          export DISPLAY=:99
 
-          echo "======================================"
-          echo "DASHBOARD ACCESS TOKEN:"
-          echo "$STUDIO_TOKEN"
-          echo "VNC PASSWORD:"
-          echo "$VNC_PASSWORD"
-          echo "======================================"
+          # Start virtual display
+          Xvfb :99 -screen 0 1440x900x24 -ac \
+            > /tmp/xvfb.log 2>&1 &
 
-          Xvfb :99 -screen 0 1440x900x24 -ac &
-          sleep 2
+          sleep 3
 
-          fluxbox &
-          sleep 2
-
-          x11vnc -display :99 \
-            -forever -shared \
-            -rfbauth <(printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd stdin /tmp/vnc.pass >/dev/null 2>&1; echo /tmp/vnc.pass) \
-            -rfbport 5900 -localhost &
+          # Start window manager
+          fluxbox > /tmp/fluxbox.log 2>&1 &
 
           sleep 2
 
-          websockify --web=/usr/share/novnc 6080 localhost:5900 \
+          # Remove old VNC password file
+          pkill -x x11vnc 2>/dev/null || true
+          rm -f /tmp/vnc.pass
+
+          # Create correct VNC password file
+          x11vnc -storepasswd \
+            "$VNC_PASSWORD" \
+            /tmp/vnc.pass
+
+          chmod 600 /tmp/vnc.pass
+
+          # Start VNC using the actual password file
+          x11vnc \
+            -display :99 \
+            -forever \
+            -shared \
+            -rfbauth /tmp/vnc.pass \
+            -rfbport 5900 \
+            -localhost \
+            > /tmp/x11vnc.log 2>&1 &
+
+          sleep 3
+
+          if ! pgrep -x x11vnc >/dev/null; then
+            cat /tmp/x11vnc.log
+            exit 1
+          fi
+
+          echo "VNC server started successfully."
+
+          # Start noVNC
+          websockify \
+            --web=/usr/share/novnc \
+            6080 localhost:5900 \
             > /tmp/novnc.log 2>&1 &
 
+          sleep 2
+
+          # Start dashboard
           python3 server.py > /tmp/studio.log 2>&1 &
           echo $! > /tmp/studio.pid
 
-          firefox --no-remote \
+          sleep 2
+
+          # Start Firefox
+          firefox \
+            --no-remote \
             --profile "$GITHUB_WORKSPACE/cloud-media-studio/profile" \
             --kiosk \
             https://www.google.com \
             > /tmp/firefox.log 2>&1 &
 
-          # Install cloudflared
+          # Download cloudflared
           curl -fL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /tmp/cloudflared
+
           chmod +x /tmp/cloudflared
 
-          /tmp/cloudflared tunnel --url http://127.0.0.1:8080 \
+          # Dashboard tunnel
+          /tmp/cloudflared tunnel \
+            --url http://127.0.0.1:8080 \
             > /tmp/dashboard-tunnel.log 2>&1 &
+
           echo $! > /tmp/dashboard-tunnel.pid
 
-          /tmp/cloudflared tunnel --url http://127.0.0.1:6080 \
+          # Browser tunnel
+          /tmp/cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
             > /tmp/browser-tunnel.log 2>&1 &
+
           echo $! > /tmp/browser-tunnel.pid
 
-          echo "Waiting for Cloudflare tunnel URLs..."
+          # Wait for tunnels
+          echo "Waiting for Cloudflare URLs..."
+
           for i in $(seq 1 60); do
-            DASHBOARD_URL="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /tmp/dashboard-tunnel.log | head -n1 || true)"
-            BROWSER_URL="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /tmp/browser-tunnel.log | head -n1 || true)"
+            DASHBOARD_URL=$(
+              grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+              /tmp/dashboard-tunnel.log | head -n1 || true
+            )
+
+            BROWSER_URL=$(
+              grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+              /tmp/browser-tunnel.log | head -n1 || true
+            )
+
             if [ -n "$DASHBOARD_URL" ] && [ -n "$BROWSER_URL" ]; then
               break
             fi
+
             sleep 2
           done
 
-          echo "======================================"
-          echo "DASHBOARD: ${DASHBOARD_URL:-NOT READY}"
-          echo "BROWSER:   ${BROWSER_URL:-NOT READY}/vnc.html"
-          echo "======================================"
-
           if [ -z "$DASHBOARD_URL" ] || [ -z "$BROWSER_URL" ]; then
-            echo "Tunnel startup failed. Logs:"
-            cat /tmp/dashboard-tunnel.log || true
-            cat /tmp/browser-tunnel.log || true
+            echo "Cloudflare tunnel failed."
+
+            cat /tmp/dashboard-tunnel.log
+            cat /tmp/browser-tunnel.log
+
             exit 1
           fi
 
-          echo "The studio is running. Keep this workflow open."
-          echo "Maximum session duration: 4 hours."
+          echo ""
+          echo "=========================================="
+          echo "CLOUD MEDIA STUDIO IS READY"
+          echo "=========================================="
+          echo "DASHBOARD:"
+          echo "$DASHBOARD_URL"
+          echo ""
+          echo "REMOTE FIREFOX:"
+          echo "$BROWSER_URL/vnc.html"
+          echo ""
+          echo "Dashboard token: configured GitHub Secret"
+          echo "Browser password: configured GitHub Secret"
+          echo "=========================================="
+
+          echo "Session will remain active for approximately 4 hours."
 
           sleep 13800
 
@@ -639,11 +891,15 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pkill -f 'firefox' || true
-          pkill -f 'cloudflared' || true
-          pkill -f 'x11vnc' || true
-          pkill -f 'websockify' || true
-          pkill -f 'Xvfb' || true
-          rm -rf "$GITHUB_WORKSPACE/cloud-media-studio/Downloads"
-          rm -rf "$GITHUB_WORKSPACE/cloud-media-studio/outputs"
-          rm -rf /tmp/vnc.pass
+          pkill -x firefox 2>/dev/null || true
+          pkill -x x11vnc 2>/dev/null || true
+          pkill -x websockify 2>/dev/null || true
+          pkill -x Xvfb 2>/dev/null || true
+          pkill -x fluxbox 2>/dev/null || true
+          pkill -f cloudflared 2>/dev/null || true
+
+          rm -f /tmp/vnc.pass
+
+          rm -rf \
+            "$GITHUB_WORKSPACE/cloud-media-studio/Downloads" \
+            "$GITHUB_WORKSPACE/cloud-media-studio/outputs"

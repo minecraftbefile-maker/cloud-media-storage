@@ -21,30 +21,30 @@ jobs:
       STUDIO_DIR: ${{ github.workspace }}/cloud-media-studio
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate secrets
+      - name: Validate configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "$STUDIO_TOKEN" ]; then
-            echo "::error::Missing STUDIO_TOKEN secret"
+          [ -n "$STUDIO_TOKEN" ] || {
+            echo "::error::STUDIO_TOKEN is missing"
             exit 1
-          fi
+          }
 
-          if [ -z "$VNC_PASSWORD" ]; then
-            echo "::error::Missing VNC_PASSWORD secret"
+          [ -n "$VNC_PASSWORD" ] || {
+            echo "::error::VNC_PASSWORD is missing"
             exit 1
-          fi
+          }
 
-          if [ "${#VNC_PASSWORD}" -gt 8 ]; then
-            echo "::error::VNC_PASSWORD must be 8 characters or fewer"
+          [ "${#VNC_PASSWORD}" -le 8 ] || {
+            echo "::error::VNC_PASSWORD must be at most 8 characters"
             exit 1
-          fi
+          }
 
-      - name: Install system dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +53,6 @@ jobs:
 
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             python3 \
-            python3-pip \
             ffmpeg \
             curl \
             wget \
@@ -68,7 +67,6 @@ jobs:
             wmctrl \
             x11-utils \
             x11-xserver-utils \
-            xterm \
             ca-certificates \
             jq
 
@@ -76,12 +74,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           sudo snap install firefox
-
           firefox --version
 
-      - name: Install Cloudflare Tunnel
+      - name: Install Cloudflare
         shell: bash
         run: |
           set -euo pipefail
@@ -89,10 +85,10 @@ jobs:
           ARCH="$(dpkg --print-architecture)"
 
           case "$ARCH" in
-            amd64) CF_ARCH="amd64" ;;
-            arm64) CF_ARCH="arm64" ;;
+            amd64) CF_ARCH=amd64 ;;
+            arm64) CF_ARCH=arm64 ;;
             *)
-              echo "::error::Unsupported architecture: $ARCH"
+              echo "::error::Unsupported architecture"
               exit 1
               ;;
           esac
@@ -104,20 +100,39 @@ jobs:
           chmod +x /tmp/cloudflared
           sudo install /tmp/cloudflared /usr/local/bin/cloudflared
 
-          cloudflared --version
-
-      - name: Create workspace
+      - name: Prepare workspace
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$STUDIO_DIR/Downloads"
-          mkdir -p "$STUDIO_DIR/Output"
-          mkdir -p "$STUDIO_DIR/profile"
-          mkdir -p "$STUDIO_DIR/temp-links"
+          mkdir -p \
+            "$STUDIO_DIR/Downloads" \
+            "$STUDIO_DIR/Output" \
+            "$STUDIO_DIR/profile" \
+            "$STUDIO_DIR/temp-links"
 
           chmod 700 "$STUDIO_DIR"
           chmod 700 "$STUDIO_DIR/temp-links"
+
+      - name: Configure uBlock Origin
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo mkdir -p /etc/firefox/policies
+
+          sudo tee /etc/firefox/policies/policies.json >/dev/null <<'EOF'
+          {
+            "policies": {
+              "ExtensionSettings": {
+                "uBlock0@raymondhill.net": {
+                  "installation_mode": "force_installed",
+                  "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
+                }
+              }
+            }
+          }
+          EOF
 
       - name: Create media server
         shell: bash
@@ -135,6 +150,7 @@ jobs:
           import mimetypes
           import threading
           import subprocess
+
           from pathlib import Path
           from urllib.parse import unquote
           from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -145,7 +161,6 @@ jobs:
           LINKS = BASE / "temp-links"
 
           TOKEN = os.environ["STUDIO_TOKEN"]
-          PORT = 8080
           LINK_TTL = 1800
 
           for folder in (DOWNLOADS, OUTPUT, LINKS):
@@ -156,24 +171,17 @@ jobs:
 
           def safe_name(value):
               value = Path(unquote(str(value))).name
-              value = re.sub(r"[^a-zA-Z0-9._ -]", "_", value)
-              value = value.strip(" .")
-              return value[:180] or "file"
-
-          def inside(path, parent):
-              try:
-                  path.resolve().relative_to(parent.resolve())
-                  return True
-              except ValueError:
-                  return False
+              value = re.sub(r'[^a-zA-Z0-9._ -]', '_', value)
+              return value.strip(" .")[:180] or "file"
 
           def get_file(name):
               name = safe_name(name)
 
               for folder in (DOWNLOADS, OUTPUT):
-                  candidate = folder / name
-                  if candidate.is_file() and inside(candidate, folder):
-                      return candidate
+                  path = folder / name
+
+                  if path.is_file():
+                      return path
 
               return None
 
@@ -188,23 +196,22 @@ jobs:
 
                   for key in expired:
                       item = active_links.pop(key)
+
                       try:
                           item["path"].unlink(missing_ok=True)
                       except OSError:
                           pass
 
-          def json_bytes(value):
-              return json.dumps(value).encode("utf-8")
-
           class Handler(BaseHTTPRequestHandler):
 
-              server_version = "CloudMediaStudio/1.0"
+              server_version = "CloudMediaStudio/2.0"
 
               def log_message(self, fmt, *args):
                   print("[HTTP]", fmt % args)
 
               def send_json(self, data, status=200):
-                  body = json_bytes(data)
+                  body = json.dumps(data).encode()
+
                   self.send_response(status)
                   self.send_header("Content-Type", "application/json")
                   self.send_header("Content-Length", str(len(body)))
@@ -213,19 +220,21 @@ jobs:
                   self.wfile.write(body)
 
               def authorized(self):
-                  supplied = self.headers.get("Authorization", "")
-                  return supplied == "Bearer " + TOKEN
+                  return self.headers.get("Authorization", "") == (
+                      "Bearer " + TOKEN
+                  )
 
               def require_auth(self):
                   if not self.authorized():
                       self.send_json({"error": "Unauthorized"}, 401)
                       return False
+
                   return True
 
               def read_json(self):
                   length = int(self.headers.get("Content-Length", "0"))
 
-                  if length < 1 or length > 1024 * 1024:
+                  if not 1 <= length <= 1024 * 1024:
                       raise ValueError("Invalid request size")
 
                   return json.loads(self.rfile.read(length))
@@ -234,11 +243,11 @@ jobs:
                   cleanup_links()
 
                   if self.path == "/":
-                      self.serve_dashboard()
+                      self.dashboard()
                       return
 
                   if self.path.startswith("/d/"):
-                      self.serve_temporary_link(self.path[3:])
+                      self.temporary_download(self.path[3:])
                       return
 
                   if not self.require_auth():
@@ -246,29 +255,27 @@ jobs:
 
                   if self.path == "/api/status":
                       self.send_json({
-                          "status": "online",
-                          "ffmpeg": shutil.which("ffmpeg") is not None,
-                          "downloads": str(len(list(DOWNLOADS.iterdir()))),
-                          "outputs": str(len(list(OUTPUT.iterdir())))
+                          "online": True,
+                          "ffmpeg": shutil.which("ffmpeg") is not None
                       })
                       return
 
                   if self.path == "/api/files":
-                      result = []
+                      files = []
 
                       for folder in (DOWNLOADS, OUTPUT):
                           for item in folder.iterdir():
                               if item.is_file() and not item.name.endswith(".part"):
                                   try:
-                                      result.append({
+                                      files.append({
                                           "name": item.name,
-                                          "size": item.stat().st_size,
-                                          "folder": folder.name
+                                          "folder": folder.name,
+                                          "size": item.stat().st_size
                                       })
                                   except OSError:
                                       pass
 
-                      self.send_json({"files": result})
+                      self.send_json({"files": files})
                       return
 
                   self.send_json({"error": "Not found"}, 404)
@@ -279,13 +286,13 @@ jobs:
 
                   try:
                       if self.path == "/api/upload":
-                          self.upload_file()
+                          self.upload()
                       elif self.path == "/api/process":
-                          self.process_file()
-                      elif self.path == "/api/zip":
-                          self.create_zip()
+                          self.process()
                       elif self.path == "/api/link":
                           self.create_link()
+                      elif self.path == "/api/zip":
+                          self.create_zip()
                       else:
                           self.send_json({"error": "Not found"}, 404)
 
@@ -295,11 +302,11 @@ jobs:
                       print("[ERROR]", repr(exc))
                       self.send_json({"error": "Operation failed"}, 500)
 
-              def upload_file(self):
+              def upload(self):
                   name = safe_name(self.headers.get("X-Filename", "upload.bin"))
                   length = int(self.headers.get("Content-Length", "0"))
 
-                  if length < 1 or length > 1024 * 1024 * 1024:
+                  if not 1 <= length <= 1024 * 1024 * 1024:
                       raise ValueError("Invalid upload size")
 
                   destination = DOWNLOADS / name
@@ -322,21 +329,18 @@ jobs:
                       "size": destination.stat().st_size
                   })
 
-              def process_file(self):
+              def process(self):
                   data = self.read_json()
-
                   source = get_file(data.get("file", ""))
                   action = data.get("action", "")
 
                   if not source:
                       raise ValueError("File not found")
 
-                  output_name = safe_name(data.get("output", ""))
-                  if not output_name:
-                      output_name = source.stem + "_processed"
+                  name = safe_name(data.get("output", source.stem))
 
                   if action == "audio_mp3":
-                      destination = OUTPUT / (output_name + ".mp3")
+                      destination = OUTPUT / (name + ".mp3")
                       command = [
                           "ffmpeg", "-y", "-i", str(source),
                           "-vn", "-codec:a", "libmp3lame",
@@ -344,7 +348,7 @@ jobs:
                       ]
 
                   elif action == "compress_video":
-                      destination = OUTPUT / (output_name + ".mp4")
+                      destination = OUTPUT / (name + ".mp4")
                       command = [
                           "ffmpeg", "-y", "-i", str(source),
                           "-c:v", "libx264",
@@ -356,17 +360,16 @@ jobs:
                       ]
 
                   elif action == "thumbnail":
-                      destination = OUTPUT / (output_name + ".jpg")
+                      destination = OUTPUT / (name + ".jpg")
                       command = [
                           "ffmpeg", "-y", "-ss", "00:00:03",
                           "-i", str(source),
                           "-frames:v", "1",
-                          "-q:v", "2",
-                          str(destination)
+                          "-q:v", "2", str(destination)
                       ]
 
                   else:
-                      raise ValueError("Unsupported operation")
+                      raise ValueError("Unknown processing operation")
 
                   result = subprocess.run(
                       command,
@@ -382,8 +385,7 @@ jobs:
 
                   self.send_json({
                       "success": True,
-                      "output": destination.name,
-                      "size": destination.stat().st_size
+                      "output": destination.name
                   })
 
               def create_zip(self):
@@ -393,9 +395,7 @@ jobs:
                   if not isinstance(names, list) or not names or len(names) > 100:
                       raise ValueError("Invalid file list")
 
-                  archive_name = safe_name(
-                      data.get("name", "media-archive")
-                  )
+                  archive_name = safe_name(data.get("name", "archive"))
 
                   if not archive_name.endswith(".zip"):
                       archive_name += ".zip"
@@ -441,7 +441,7 @@ jobs:
                       "expires_in": LINK_TTL
                   })
 
-              def serve_temporary_link(self, token):
+              def temporary_download(self, token):
                   if not re.fullmatch(r"[a-f0-9]{32}", token):
                       self.send_error(404)
                       return
@@ -475,52 +475,47 @@ jobs:
                   with path.open("rb") as source:
                       shutil.copyfileobj(source, self.wfile)
 
-              def serve_dashboard(self):
-                  page = DASHBOARD.encode("utf-8")
+              def dashboard(self):
+                  body = PAGE.encode()
 
                   self.send_response(200)
                   self.send_header("Content-Type", "text/html; charset=utf-8")
-                  self.send_header("Content-Length", str(len(page)))
+                  self.send_header("Content-Length", str(len(body)))
                   self.send_header("Cache-Control", "no-store")
                   self.end_headers()
-                  self.wfile.write(page)
+                  self.wfile.write(body)
 
-          DASHBOARD = r"""
+          PAGE = r"""
           <!DOCTYPE html>
           <html lang="en">
           <head>
           <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
           <title>Cloud Media Studio</title>
           <style>
           *{box-sizing:border-box}
           body{margin:0;background:#0b1020;color:#e7edff;font-family:Arial,sans-serif}
           header{padding:22px 5%;background:#111a31;border-bottom:1px solid #263452}
           header h1{margin:0;font-size:24px}
-          header p{margin:7px 0 0;color:#91a3c5}
+          header p{color:#91a3c5}
           main{max-width:1150px;margin:28px auto;padding:0 18px}
-          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
           .card{background:#121c33;border:1px solid #263452;border-radius:14px;padding:20px}
-          h2{font-size:18px;margin:0 0 16px}
-          button,.button{border:0;background:#4269ed;color:white;padding:11px 15px;
-          border-radius:8px;cursor:pointer;font-weight:600}
+          h2{font-size:18px;margin-top:0}
+          button{border:0;background:#4269ed;color:white;padding:11px 15px;border-radius:8px;cursor:pointer}
           button:hover{background:#5c7df5}
-          input,select{width:100%;padding:11px;margin:7px 0 13px;background:#0b1428;
-          color:white;border:1px solid #334466;border-radius:8px}
+          input,select{width:100%;padding:11px;margin:7px 0 13px;background:#0b1428;color:white;border:1px solid #334466;border-radius:8px}
           .muted{color:#94a6c7;font-size:13px}
-          .status{padding:12px;background:#0b1428;border-radius:9px;margin-top:12px}
+          .status{padding:12px;background:#0b1428;border-radius:9px}
           .files{margin-top:20px}
-          .file{display:flex;justify-content:space-between;gap:10px;padding:12px;
-          border-bottom:1px solid #263452;align-items:center;flex-wrap:wrap}
-          .file button{padding:8px 10px;font-size:12px}
+          .file{display:flex;justify-content:space-between;gap:10px;padding:12px;border-bottom:1px solid #263452;align-items:center;flex-wrap:wrap}
           #message{margin-top:18px;white-space:pre-wrap;color:#9db8ff}
-          @media(max-width:600px){.file{align-items:flex-start;flex-direction:column}}
           </style>
           </head>
           <body>
           <header>
             <h1>Cloud Media Studio</h1>
-            <p>Temporary cloud workstation · File manager · FFmpeg tools</p>
+            <p>Remote workstation · File manager · FFmpeg</p>
           </header>
 
           <main>
@@ -528,33 +523,33 @@ jobs:
               <section class="card">
                 <h2>Upload files</h2>
                 <input id="upload" type="file" multiple>
-                <button onclick="uploadFiles()">Upload selected files</button>
-                <p class="muted">Files are saved in your Downloads folder.</p>
+                <button onclick="uploadFiles()">Upload</button>
+                <p class="muted">Files go to Downloads.</p>
               </section>
 
               <section class="card">
-                <h2>Media processing</h2>
+                <h2>Media tools</h2>
                 <select id="processFile"></select>
                 <select id="action">
                   <option value="compress_video">Compress video to MP4</option>
                   <option value="audio_mp3">Extract audio to MP3</option>
                   <option value="thumbnail">Create thumbnail</option>
                 </select>
-                <input id="outputName" placeholder="Output filename (optional)">
-                <button onclick="processFile()">Start processing</button>
+                <input id="outputName" placeholder="Output filename">
+                <button onclick="processFile()">Process</button>
               </section>
 
               <section class="card">
                 <h2>Session</h2>
                 <div class="status" id="status">Connecting...</div>
-                <p class="muted">Temporary download links expire after 30 minutes.</p>
-                <button onclick="refreshFiles()">Refresh files</button>
+                <p class="muted">Temporary links expire after 30 minutes.</p>
+                <button onclick="refreshFiles()">Refresh</button>
               </section>
             </div>
 
             <section class="card files">
-              <h2>File manager</h2>
-              <div id="files">Loading files...</div>
+              <h2>Files</h2>
+              <div id="files">Loading...</div>
             </section>
 
             <div id="message"></div>
@@ -565,21 +560,21 @@ jobs:
           let token = localStorage.getItem("studio_token");
 
           if (!token) {
-            token = prompt("Enter your Studio Token:");
+            token = prompt("Enter Studio Token");
             if (token) localStorage.setItem("studio_token", token);
           }
 
           async function api(path, options={}) {
             options.headers = {
               ...(options.headers || {}),
-              "Authorization": "Bearer " + token
+              Authorization: "Bearer " + token
             };
 
             const response = await fetch(path, options);
 
             if (response.status === 401) {
               localStorage.removeItem("studio_token");
-              throw new Error("Invalid token. Reload and enter the correct token.");
+              throw new Error("Invalid token. Reload and try again.");
             }
 
             const data = await response.json();
@@ -615,16 +610,13 @@ jobs:
 
                 const label = document.createElement("span");
                 label.textContent = file.name + " · " +
-                  (file.size / 1024 / 1024).toFixed(2) + " MB";
+                  (file.size / 1048576).toFixed(2) + " MB";
 
-                const actions = document.createElement("div");
+                const button = document.createElement("button");
+                button.textContent = "Create temporary link";
+                button.onclick = () => makeLink(file.name);
 
-                const link = document.createElement("button");
-                link.textContent = "Temporary link";
-                link.onclick = () => makeLink(file.name);
-
-                actions.appendChild(link);
-                row.append(label, actions);
+                row.append(label, button);
                 container.appendChild(row);
               }
 
@@ -642,7 +634,7 @@ jobs:
 
             for (const file of files) {
               try {
-                notify("Uploading " + file.name + "...");
+                notify("Uploading " + file.name);
 
                 await api("/api/upload", {
                   method: "POST",
@@ -692,8 +684,13 @@ jobs:
               });
 
               const url = location.origin + result.url;
-              await navigator.clipboard.writeText(url);
-              notify("Temporary link copied: " + url);
+
+              try {
+                await navigator.clipboard.writeText(url);
+                notify("Link copied: " + url);
+              } catch {
+                notify("Temporary link: " + url);
+              }
 
             } catch (error) {
               notify(error.message);
@@ -720,12 +717,11 @@ jobs:
           """
 
           if __name__ == "__main__":
-              print("[Studio] Starting on port", PORT, flush=True)
-              server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-              server.serve_forever()
+              print("[Studio] Listening on port 8080", flush=True)
+              ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
           PY
 
-      - name: Start Linux desktop and VNC
+      - name: Start Linux desktop
         shell: bash
         run: |
           set -euo pipefail
@@ -733,22 +729,18 @@ jobs:
           export DISPLAY=:99
 
           Xvfb :99 \
-            -screen 0 1600x900x24 \
+            -screen 0 1366x768x24 \
             -ac \
             +extension RANDR \
             > /tmp/xvfb.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if xdpyinfo -display :99 >/dev/null 2>&1; then
-              break
-            fi
+            xdpyinfo -display :99 >/dev/null 2>&1 && break
             sleep 1
           done
 
           xdpyinfo -display :99 >/dev/null
 
-          # Linux desktop: clean Fluxbox session without desktop panels.
-          # Firefox itself will NOT run in browser kiosk mode.
           fluxbox > /tmp/fluxbox.log 2>&1 &
 
           sleep 2
@@ -758,7 +750,6 @@ jobs:
           xset s noblank
           xsetroot -solid "#101827"
 
-          # Correct VNC password-file creation.
           x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass
           chmod 600 /tmp/vnc.pass
 
@@ -774,9 +765,7 @@ jobs:
             > /tmp/x11vnc.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if ss -lnt | grep -q ':5900'; then
-              break
-            fi
+            ss -lnt | grep -q ':5900' && break
             sleep 1
           done
 
@@ -789,37 +778,31 @@ jobs:
 
           websockify \
             --web=/usr/share/novnc \
-            6080 \
-            localhost:5900 \
+            6080 localhost:5900 \
             > /tmp/novnc.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; then
-              break
-            fi
+            curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null && break
             sleep 1
           done
 
           curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
 
-      - name: Start media dashboard
+      - name: Start dashboard
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 "$STUDIO_DIR/server.py" \
-            > /tmp/studio.log 2>&1 &
+          python3 "$STUDIO_DIR/server.py" > /tmp/studio.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
-              break
-            fi
+            curl -fsS http://127.0.0.1:8080/ >/dev/null && break
             sleep 1
           done
 
           curl -fsS http://127.0.0.1:8080/ >/dev/null
 
-      - name: Start normal Firefox browser
+      - name: Start normal Firefox
         shell: bash
         run: |
           set -euo pipefail
@@ -827,23 +810,14 @@ jobs:
           export DISPLAY=:99
           export MOZ_ENABLE_WAYLAND=0
 
-          mkdir -p "$STUDIO_DIR/Downloads"
-
-          cat > "$STUDIO_DIR/profile/user.js" <<'EOF'
+          cat > "$STUDIO_DIR/profile/user.js" <<EOF
           user_pref("browser.download.folderList", 2);
-          user_pref("browser.download.dir", "__DOWNLOAD_DIR__");
+          user_pref("browser.download.dir", "$STUDIO_DIR/Downloads");
           user_pref("browser.download.useDownloadDir", true);
-          user_pref("browser.download.manager.showWhenStarting", true);
           user_pref("browser.shell.checkDefaultBrowser", false);
           user_pref("browser.startup.homepage", "https://www.google.com");
-          user_pref("browser.tabs.warnOnClose", false);
-          user_pref("browser.aboutConfig.showWarning", false);
           EOF
 
-          sed -i "s|__DOWNLOAD_DIR__|$STUDIO_DIR/Downloads|" \
-            "$STUDIO_DIR/profile/user.js"
-
-          # Normal Firefox: tabs, address bar, menus and context menu enabled.
           firefox \
             --no-remote \
             --profile "$STUDIO_DIR/profile" \
@@ -851,18 +825,17 @@ jobs:
             https://www.google.com \
             > /tmp/firefox.log 2>&1 &
 
-          # Wait for the browser window.
           for i in $(seq 1 40); do
-            if wmctrl -l | grep -qi firefox; then
-              break
-            fi
+            wmctrl -l | grep -qi "Mozilla Firefox" && break
             sleep 2
           done
 
-          # Maximize the window, but do not fullscreen Firefox.
-          wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz || true
+          # Maximize the actual Firefox window, not whichever window is active.
+          wmctrl -r "Mozilla Firefox" \
+            -b add,maximized_vert,maximized_horz || true
 
-          wmctrl -l || true
+          echo "Firefox window list:"
+          wmctrl -l
 
       - name: Start Cloudflare tunnels
         shell: bash
@@ -879,7 +852,8 @@ jobs:
             --no-autoupdate \
             > /tmp/cloudflared-browser.log 2>&1 &
 
-          echo "Waiting for Cloudflare tunnel URLs..."
+          DASHBOARD_URL=""
+          BROWSER_URL=""
 
           for i in $(seq 1 90); do
             DASHBOARD_URL="$(
@@ -899,43 +873,43 @@ jobs:
             sleep 2
           done
 
-          if [ -z "${DASHBOARD_URL:-}" ] || [ -z "${BROWSER_URL:-}" ]; then
-            echo "::error::Could not obtain Cloudflare tunnel URLs"
-            echo "Dashboard tunnel log:"
+          if [ -z "$DASHBOARD_URL" ] || [ -z "$BROWSER_URL" ]; then
+            echo "::error::Cloudflare tunnel startup failed"
             tail -n 60 /tmp/cloudflared-dashboard.log
-            echo "Browser tunnel log:"
             tail -n 60 /tmp/cloudflared-browser.log
             exit 1
           fi
 
-          echo "========================================"
-          echo "CLOUD MEDIA STUDIO IS RUNNING"
-          echo "========================================"
+          echo "===================================="
+          echo "CLOUD MEDIA STUDIO"
+          echo "===================================="
           echo "Dashboard: $DASHBOARD_URL"
-          echo "Remote Linux Desktop: $BROWSER_URL/vnc.html"
-          echo "VNC password: configured GitHub Secret"
-          echo "Dashboard token: configured GitHub Secret"
-          echo "========================================"
+          echo "Remote Desktop: ${BROWSER_URL}/vnc.html?resize=scale"
+          echo "Display resolution: 1366x768"
+          echo "===================================="
 
       - name: Keep session alive
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Cloud Media Studio is running."
-          echo "Session duration: up to 4 hours."
-
           for i in $(seq 1 240); do
-            if ! kill -0 "$(pgrep -f 'server.py' | head -n 1)" 2>/dev/null; then
-              echo "::error::Media server stopped"
+
+            if ! pgrep -f '[s]erver.py' >/dev/null; then
+              echo "::error::Dashboard server stopped"
               tail -n 100 /tmp/studio.log || true
+              exit 1
+            fi
+
+            if ! pgrep -f '[c]loudflared tunnel' >/dev/null; then
+              echo "::error::Cloudflare tunnel stopped"
               exit 1
             fi
 
             sleep 60
           done
 
-      - name: Print diagnostic logs
+      - name: Diagnostics
         if: always()
         shell: bash
         run: |
@@ -943,26 +917,31 @@ jobs:
           tail -n 80 /tmp/studio.log 2>/dev/null || true
 
           echo "========== FIREFOX =========="
-          tail -n 50 /tmp/firefox.log 2>/dev/null || true
+          tail -n 60 /tmp/firefox.log 2>/dev/null || true
 
           echo "========== VNC =========="
-          tail -n 50 /tmp/x11vnc.log 2>/dev/null || true
+          tail -n 60 /tmp/x11vnc.log 2>/dev/null || true
 
           echo "========== NOVNC =========="
-          tail -n 50 /tmp/novnc.log 2>/dev/null || true
+          tail -n 40 /tmp/novnc.log 2>/dev/null || true
 
           echo "========== FLUXBOX =========="
-          tail -n 30 /tmp/fluxbox.log 2>/dev/null || true
+          tail -n 40 /tmp/fluxbox.log 2>/dev/null || true
+
+          echo "========== CLOUDFLARE =========="
+          tail -n 40 /tmp/cloudflared-dashboard.log 2>/dev/null || true
+          tail -n 40 /tmp/cloudflared-browser.log 2>/dev/null || true
 
       - name: Cleanup
         if: always()
         shell: bash
         run: |
-          pkill -f cloudflared || true
-          pkill -f 'server.py' || true
-          pkill -f websockify || true
-          pkill -f x11vnc || true
-          pkill -f firefox || true
-          pkill -f fluxbox || true
-          pkill -f Xvfb || true
+          pkill -f '[c]loudflared' || true
+          pkill -f '[s]erver.py' || true
+          pkill -f '[w]ebsockify' || true
+          pkill -f '[x]11vnc' || true
+          pkill -f '[f]irefox' || true
+          pkill -f '[f]luxbox' || true
+          pkill -f '[X]vfb' || true
+
           rm -f /tmp/vnc.pass
